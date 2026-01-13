@@ -1,5 +1,5 @@
-# Orderly - AI增强型本地文件整理工具
 现在正在开发中，可以等到完善了再用
+# Orderly - AI增强型本地文件整理工具
 <p align="center">
   <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language">
   <img src="https://img.shields.io/badge/GUI-egui-blue" alt="GUI">
