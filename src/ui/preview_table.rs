@@ -9,6 +9,7 @@
 use crate::core::models::{FileDescriptor, SuggestionSource};
 use crate::ui::styles::Theme;
 use eframe::egui::{self, RichText, Ui};
+use std::path::{Path, PathBuf};
 
 /// 预览表格
 pub struct PreviewTable {
@@ -34,6 +35,28 @@ pub enum SortColumn {
     Target,
     Confidence,
     Source,
+}
+
+fn effective_target_path(file: &FileDescriptor, suggested: &Path) -> PathBuf {
+    // 与执行层保持一致：只做“分类移动”，最终目标必须使用原文件名。
+    // 如果 suggested 看起来已经包含文件名（等于原名 / 以扩展名结尾），则取其 parent 作为目录。
+    let leaf = suggested
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    let ext_lower = file.extension.to_lowercase();
+    let looks_like_file_path = (!leaf.is_empty() && leaf == file.name)
+        || (!ext_lower.is_empty() && leaf.to_lowercase().ends_with(&ext_lower));
+
+    let target_dir = if looks_like_file_path {
+        suggested.parent().unwrap_or(suggested)
+    } else {
+        suggested
+    };
+
+    target_dir.join(&file.name)
 }
 
 impl Default for PreviewTable {
@@ -247,7 +270,8 @@ impl PreviewTable {
 
                     // 建议路径
                     if let Some(ref suggestion) = file.suggested_action {
-                        let target = suggestion.target_path.to_string_lossy();
+                        let target_path = effective_target_path(file, &suggestion.target_path);
+                        let target = target_path.to_string_lossy();
                         let truncated_target = Self::truncate_path(&target, 40);
                         ui.label(&truncated_target).on_hover_text(&*target);
 
@@ -339,8 +363,16 @@ impl PreviewTable {
                 SortColumn::Name => a.name.cmp(&b.name),
                 SortColumn::Path => a.parent_dir.cmp(&b.parent_dir),
                 SortColumn::Target => {
-                    let a_target = a.suggested_action.as_ref().map(|s| &s.target_path);
-                    let b_target = b.suggested_action.as_ref().map(|s| &s.target_path);
+                    let a_target = a
+                        .suggested_action
+                        .as_ref()
+                        .map(|s| effective_target_path(a, &s.target_path).to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let b_target = b
+                        .suggested_action
+                        .as_ref()
+                        .map(|s| effective_target_path(b, &s.target_path).to_string_lossy().to_string())
+                        .unwrap_or_default();
                     a_target.cmp(&b_target)
                 }
                 SortColumn::Confidence => {
