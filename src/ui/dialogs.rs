@@ -2,6 +2,40 @@
 
 use eframe::egui::{self, RichText};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiInterfaceKind {
+    Ollama,
+    OpenAIChatCompletions,
+    OpenAIResponses,
+    Custom,
+}
+
+impl ApiInterfaceKind {
+    fn label(&self) -> &'static str {
+        match self {
+            ApiInterfaceKind::Ollama => "Ollama（/api/generate）",
+            ApiInterfaceKind::OpenAIChatCompletions => "OpenAI Chat Completions（/v1/chat/completions）",
+            ApiInterfaceKind::OpenAIResponses => "OpenAI Responses（/v1/responses）",
+            ApiInterfaceKind::Custom => "自定义（完整URL）",
+        }
+    }
+
+    fn standard_suffix(&self) -> Option<&'static str> {
+        match self {
+            ApiInterfaceKind::Ollama => Some("/api/generate"),
+            ApiInterfaceKind::OpenAIChatCompletions => Some("/v1/chat/completions"),
+            ApiInterfaceKind::OpenAIResponses => Some("/v1/responses"),
+            ApiInterfaceKind::Custom => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrlSuffixMode {
+    Standard,
+    Custom,
+}
+
 /// 提示词输入对话框
 pub struct PromptDialog {
     /// 是否显示
@@ -422,8 +456,14 @@ pub enum ErrorClusterResult {
 pub struct SettingsDialog {
     /// 是否显示
     pub visible: bool,
-    /// AI端点
-    pub ai_endpoint: String,
+    /// API 接口类型
+    pub api_kind: ApiInterfaceKind,
+    /// URL 后缀模式
+    pub suffix_mode: UrlSuffixMode,
+    /// API 基地址（Custom 模式下为完整 URL）
+    pub api_base_url: String,
+    /// 自定义后缀（仅 suffix_mode=Custom 且 api_kind!=Custom 时生效）
+    pub custom_suffix: String,
     /// AI密钥
     pub ai_key: String,
     /// 模型名称
@@ -442,7 +482,10 @@ impl Default for SettingsDialog {
     fn default() -> Self {
         Self {
             visible: false,
-            ai_endpoint: "http://localhost:11434/api/generate".to_string(),
+            api_kind: ApiInterfaceKind::Ollama,
+            suffix_mode: UrlSuffixMode::Standard,
+            api_base_url: "http://localhost:11434".to_string(),
+            custom_suffix: "/api/generate".to_string(),
             ai_key: String::new(),
             model_name: "qwen3:30b-a3b".to_string(),
             confidence_threshold: 0.7,
@@ -454,6 +497,114 @@ impl Default for SettingsDialog {
 }
 
 impl SettingsDialog {
+    pub fn load_from_config(&mut self, config: &crate::core::models::AppConfig) {
+        self.ai_enabled = config.ai_enabled;
+        self.ai_key = config.ai_config.api_key.clone();
+        self.model_name = config.ai_config.model_name.clone();
+        self.confidence_threshold = config.confidence_threshold;
+
+        if let Some(ref p) = config.default_scan_path {
+            self.default_scan_path = p.to_string_lossy().to_string();
+        }
+        if let Some(ref p) = config.default_output_base {
+            self.default_output_path = p.to_string_lossy().to_string();
+        }
+
+        let (kind, base, suffix_mode, custom_suffix) = Self::split_endpoint(&config.ai_config.api_endpoint);
+        self.api_kind = kind;
+        self.api_base_url = base;
+        self.suffix_mode = suffix_mode;
+        self.custom_suffix = custom_suffix;
+    }
+
+    pub fn effective_endpoint(&self) -> String {
+        let base = self.api_base_url.trim().trim_end_matches('/');
+        if base.is_empty() {
+            return String::new();
+        }
+
+        if self.api_kind == ApiInterfaceKind::Custom {
+            return base.to_string();
+        }
+
+        let suffix = match self.suffix_mode {
+            UrlSuffixMode::Standard => self.api_kind.standard_suffix().unwrap_or(""),
+            UrlSuffixMode::Custom => self.custom_suffix.trim(),
+        };
+
+        if suffix.is_empty() {
+            return base.to_string();
+        }
+
+        if suffix.starts_with('/') {
+            format!("{}{}", base, suffix)
+        } else {
+            format!("{}/{}", base, suffix)
+        }
+    }
+
+    fn split_endpoint(endpoint: &str) -> (ApiInterfaceKind, String, UrlSuffixMode, String) {
+        let e = endpoint.trim().trim_end_matches('/');
+        if e.is_empty() {
+            return (
+                ApiInterfaceKind::Ollama,
+                "http://localhost:11434".to_string(),
+                UrlSuffixMode::Standard,
+                "/api/generate".to_string(),
+            );
+        }
+
+        // Ollama: 以 /api/ 作为分割点
+        if e.contains("11434") || e.contains("ollama") {
+            if let Some(idx) = e.find("/api/") {
+                let base = e[..idx].to_string();
+                let suffix = e[idx..].to_string();
+                if suffix == "/api/generate" {
+                    return (ApiInterfaceKind::Ollama, base, UrlSuffixMode::Standard, suffix);
+                }
+                return (ApiInterfaceKind::Ollama, base, UrlSuffixMode::Custom, suffix);
+            }
+            return (
+                ApiInterfaceKind::Ollama,
+                e.to_string(),
+                UrlSuffixMode::Standard,
+                "/api/generate".to_string(),
+            );
+        }
+
+        // OpenAI / OpenAI-compatible: 以 /v1/ 分割
+        if let Some(idx) = e.find("/v1/") {
+            let base = e[..idx].to_string();
+            let suffix = e[idx..].to_string();
+            if suffix.starts_with("/v1/chat/completions") {
+                let mode = if suffix == "/v1/chat/completions" {
+                    UrlSuffixMode::Standard
+                } else {
+                    UrlSuffixMode::Custom
+                };
+                return (ApiInterfaceKind::OpenAIChatCompletions, base, mode, suffix);
+            }
+            if suffix.starts_with("/v1/responses") {
+                let mode = if suffix == "/v1/responses" {
+                    UrlSuffixMode::Standard
+                } else {
+                    UrlSuffixMode::Custom
+                };
+                return (ApiInterfaceKind::OpenAIResponses, base, mode, suffix);
+            }
+            return (ApiInterfaceKind::OpenAIChatCompletions, base, UrlSuffixMode::Custom, suffix);
+        }
+
+        // 兼容只填到 /chat/completions 的情况
+        if let Some(idx) = e.find("/chat/completions") {
+            let base = e[..idx].to_string();
+            let suffix = e[idx..].to_string();
+            return (ApiInterfaceKind::OpenAIChatCompletions, base, UrlSuffixMode::Custom, suffix);
+        }
+
+        (ApiInterfaceKind::Custom, e.to_string(), UrlSuffixMode::Custom, String::new())
+    }
+
     /// 渲染对话框
     pub fn render(&mut self, ctx: &egui::Context) -> SettingsResult {
         let mut result = SettingsResult::None;
@@ -474,9 +625,51 @@ impl SettingsDialog {
                 });
 
                 ui.horizontal(|ui| {
-                    ui.label("API 端点:");
-                    ui.text_edit_singleline(&mut self.ai_endpoint);
+                    ui.label("API 接口:");
+                    egui::ComboBox::from_id_salt("api_kind")
+                        .selected_text(self.api_kind.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.api_kind, ApiInterfaceKind::Ollama, ApiInterfaceKind::Ollama.label());
+                            ui.selectable_value(&mut self.api_kind, ApiInterfaceKind::OpenAIChatCompletions, ApiInterfaceKind::OpenAIChatCompletions.label());
+                            ui.selectable_value(&mut self.api_kind, ApiInterfaceKind::OpenAIResponses, ApiInterfaceKind::OpenAIResponses.label());
+                            ui.selectable_value(&mut self.api_kind, ApiInterfaceKind::Custom, ApiInterfaceKind::Custom.label());
+                        });
                 });
+
+                if self.api_kind == ApiInterfaceKind::Custom {
+                    ui.horizontal(|ui| {
+                        ui.label("API 端点(完整URL):");
+                        ui.text_edit_singleline(&mut self.api_base_url);
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("API 基地址:");
+                        ui.text_edit_singleline(&mut self.api_base_url);
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("URL 后缀:");
+                        ui.radio_value(&mut self.suffix_mode, UrlSuffixMode::Standard, "标准后缀");
+                        ui.radio_value(&mut self.suffix_mode, UrlSuffixMode::Custom, "自定义后缀");
+                    });
+
+                    if self.suffix_mode == UrlSuffixMode::Custom {
+                        ui.horizontal(|ui| {
+                            ui.label("自定义后缀:");
+                            ui.text_edit_singleline(&mut self.custom_suffix);
+                        });
+                    } else if let Some(s) = self.api_kind.standard_suffix() {
+                        ui.horizontal(|ui| {
+                            ui.label("标准后缀:");
+                            ui.label(s);
+                        });
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label("最终请求URL:");
+                        ui.label(self.effective_endpoint());
+                    });
+                }
 
                 ui.horizontal(|ui| {
                     ui.label("API 密钥:");

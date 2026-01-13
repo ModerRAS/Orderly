@@ -104,7 +104,24 @@ API端点: http://localhost:11434/api/generate
 模型: qwen3:30b-a3b
 ```
 
-也支持OpenAI兼容API。
+也支持 OpenAI 接口（以及 OpenAI 兼容接口）。
+
+#### Ollama
+
+- 推荐填写：`http://localhost:11434/api/generate`
+- 也可以只填：`http://localhost:11434`（程序会自动补齐到 `/api/generate`）
+
+#### OpenAI（Chat Completions）
+
+- 推荐填写：`https://api.openai.com/v1/chat/completions`
+- 也可以只填：`https://api.openai.com/v1`（程序会自动补齐到 `/chat/completions`）
+- 需要在设置里填写 `API 密钥`（即 OpenAI API Key）
+- 模型名称填写你账号可用的模型名（例如：`gpt-4o-mini`，以实际可用为准）
+
+#### OpenAI（Responses，可选）
+
+- 如果你的服务端只暴露 `Responses` 风格接口，可填写：`https://api.openai.com/v1/responses`
+- 仍需填写 `API 密钥`
 
 ### 内置规则
 

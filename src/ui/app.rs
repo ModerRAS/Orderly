@@ -10,7 +10,8 @@ use crate::core::models::{
 use crate::core::planner::Planner;
 use crate::core::rule_engine::RuleEngine;
 use crate::core::scanner::FileScanner;
-use crate::core::semantic::mock_semantic_analysis;
+use crate::core::semantic::{mock_semantic_analysis, SemanticEngine};
+use crate::storage::config::ConfigManager;
 use crate::ui::dialogs::{
     ErrorClusterDialog, ErrorClusterResult, ExecuteConfirmDialog, ExecuteConfirmResult,
     PromptDialog, PromptDialogResult, RuleConfirmDialog, RuleConfirmResult,
@@ -21,6 +22,7 @@ use crate::ui::rule_panel::{RulePanel, RulePanelAction};
 use crate::ui::styles::Theme;
 use eframe::egui::{self, RichText};
 use std::path::PathBuf;
+use tokio::runtime::Runtime;
 
 /// 应用状态
 #[derive(PartialEq)]
@@ -44,6 +46,8 @@ pub struct OrderlyApp {
     state: AppState,
     /// 配置
     config: AppConfig,
+    /// 配置管理器
+    config_manager: ConfigManager,
     /// 主题
     theme: Theme,
     /// 扫描路径
@@ -96,12 +100,35 @@ impl OrderlyApp {
             .map(|d| d.data_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
 
+        // 加载配置
+        let config_path = ConfigManager::default_path();
+        let config_manager = ConfigManager::new(config_path);
+        let config = match config_manager.load() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("加载配置失败，使用默认配置: {}", e);
+                AppConfig::default()
+            }
+        };
+
+        let scan_path = config
+            .default_scan_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let output_path = config
+            .default_output_base
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
         Self {
             state: AppState::Initial,
-            config: AppConfig::default(),
+            config,
+            config_manager,
             theme: Theme::default(),
-            scan_path: String::new(),
-            output_path: String::new(),
+            scan_path,
+            output_path,
             files: Vec::new(),
             rule_engine: None,
             planner: None,
@@ -175,13 +202,43 @@ impl OrderlyApp {
             engine.match_files(&mut self.files);
         }
 
-        // 对没有规则匹配的文件使用模拟AI分析
+        let output_base = if self.output_path.is_empty() {
+            PathBuf::from(&self.scan_path)
+        } else {
+            PathBuf::from(&self.output_path)
+        };
+
+        // 对没有规则匹配的文件使用 AI 语义分析（失败时回退模拟）
+        let mut rt = match Runtime::new() {
+            Ok(rt) => Some(rt),
+            Err(e) => {
+                tracing::warn!("Tokio Runtime 初始化失败，回退模拟AI: {}", e);
+                None
+            }
+        };
+
+        let ai_engine = if self.config.ai_enabled {
+            Some(SemanticEngine::new(self.config.ai_config.clone(), output_base.clone()))
+        } else {
+            None
+        };
+
         for file in self.files.iter_mut() {
             if file.suggested_action.is_none() && !file.atomic && !file.is_directory {
-                // 模拟语义分析
-                let semantic = mock_semantic_analysis(file);
+                let semantic = if let (Some(ref engine), Some(ref mut runtime)) = (&ai_engine, &mut rt) {
+                    match runtime.block_on(engine.analyze_file(file)) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!("AI分析失败，回退模拟AI: {}", e);
+                            mock_semantic_analysis(file)
+                        }
+                    }
+                } else {
+                    mock_semantic_analysis(file)
+                };
+
                 file.semantic = Some(semantic);
-                
+
                 // 尝试再次规则匹配
                 if let Some(ref mut engine) = self.rule_engine {
                     if let Some(suggestion) = engine.match_file(file) {
@@ -341,6 +398,7 @@ impl eframe::App for OrderlyApp {
                         ui.close_menu();
                     }
                     if ui.button("⚙️ 设置").clicked() {
+                        self.settings_dialog.load_from_config(&self.config);
                         self.settings_dialog.visible = true;
                         ui.close_menu();
                     }
@@ -614,7 +672,7 @@ impl OrderlyApp {
         match self.settings_dialog.render(ctx) {
             SettingsResult::Save => {
                 // 保存设置
-                self.config.ai_config.api_endpoint = self.settings_dialog.ai_endpoint.clone();
+                self.config.ai_config.api_endpoint = self.settings_dialog.effective_endpoint();
                 self.config.ai_config.api_key = self.settings_dialog.ai_key.clone();
                 self.config.ai_config.model_name = self.settings_dialog.model_name.clone();
                 self.config.confidence_threshold = self.settings_dialog.confidence_threshold;
@@ -626,8 +684,11 @@ impl OrderlyApp {
                 if !self.settings_dialog.default_output_path.is_empty() {
                     self.config.default_output_base = Some(PathBuf::from(&self.settings_dialog.default_output_path));
                 }
-                
-                self.status_message = "设置已保存".to_string();
+
+                match self.config_manager.save(&self.config) {
+                    Ok(_) => self.status_message = "设置已保存".to_string(),
+                    Err(e) => self.status_message = format!("设置已保存，但写入配置文件失败: {}", e),
+                }
             }
             SettingsResult::Cancel => {}
             SettingsResult::None => {}

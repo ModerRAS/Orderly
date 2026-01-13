@@ -17,6 +17,13 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiApiKind {
+    OllamaGenerate,
+    OpenAIChatCompletions,
+    OpenAIResponses,
+}
+
 /// AI语义分析引擎
 pub struct SemanticEngine {
     /// AI配置
@@ -318,18 +325,66 @@ impl SemanticEngine {
 
     /// 调用AI API
     async fn call_ai(&self, prompt: &str) -> Result<String> {
-        // 支持OpenAI兼容API和Ollama API
-        if self.config.api_endpoint.contains("ollama") 
-            || self.config.api_endpoint.contains("11434") 
-        {
-            self.call_ollama(prompt).await
-        } else {
-            self.call_openai_compatible(prompt).await
+        let (kind, endpoint) = self.normalize_ai_endpoint()?;
+        match kind {
+            AiApiKind::OllamaGenerate => self.call_ollama(prompt, &endpoint).await,
+            AiApiKind::OpenAIChatCompletions => self.call_openai_chat_completions(prompt, &endpoint).await,
+            AiApiKind::OpenAIResponses => self.call_openai_responses(prompt, &endpoint).await,
         }
     }
 
+    fn normalize_ai_endpoint(&self) -> Result<(AiApiKind, String)> {
+        let raw = self.config.api_endpoint.trim();
+        if raw.is_empty() {
+            return Err(anyhow::anyhow!("AI API端点为空"));
+        }
+
+        // 统一去掉尾部斜杠，避免后续拼接出现双斜杠
+        let endpoint = raw.trim_end_matches('/').to_string();
+
+        // 1) Ollama: 允许用户只填 host（如 http://localhost:11434），自动补齐到 /api/generate
+        let looks_like_ollama = endpoint.contains("11434") || endpoint.contains("ollama");
+        if looks_like_ollama {
+            if endpoint.contains("/api/generate") {
+                return Ok((AiApiKind::OllamaGenerate, endpoint));
+            }
+            return Ok((
+                AiApiKind::OllamaGenerate,
+                format!("{}/api/generate", endpoint),
+            ));
+        }
+
+        // 2) OpenAI: 允许用户填 base（如 https://api.openai.com/v1），自动补齐到 /chat/completions
+        if endpoint.contains("/v1/responses") {
+            return Ok((AiApiKind::OpenAIResponses, endpoint));
+        }
+        if endpoint.contains("/v1/chat/completions") || endpoint.contains("/chat/completions") {
+            return Ok((AiApiKind::OpenAIChatCompletions, endpoint));
+        }
+
+        // 常见的 OpenAI 兼容基地址（例如 .../v1 或 .../compatible-mode/v1）
+        let is_v1_like_base = endpoint.ends_with("/v1") || endpoint.ends_with("compatible-mode/v1");
+        if is_v1_like_base {
+            return Ok((
+                AiApiKind::OpenAIChatCompletions,
+                format!("{}/chat/completions", endpoint),
+            ));
+        }
+
+        // OpenAI 官方域名但没写 /v1 时，补齐到 /v1/chat/completions
+        if endpoint.contains("api.openai.com") && !endpoint.contains("/v1") {
+            return Ok((
+                AiApiKind::OpenAIChatCompletions,
+                format!("{}/v1/chat/completions", endpoint),
+            ));
+        }
+
+        // 兜底：认为用户填写的是完整 OpenAI 兼容接口路径
+        Ok((AiApiKind::OpenAIChatCompletions, endpoint))
+    }
+
     /// 调用Ollama API
-    async fn call_ollama(&self, prompt: &str) -> Result<String> {
+    async fn call_ollama(&self, prompt: &str, endpoint: &str) -> Result<String> {
         #[derive(Serialize)]
         struct OllamaRequest {
             model: String,
@@ -350,7 +405,7 @@ impl SemanticEngine {
 
         let response = self
             .client
-            .post(&self.config.api_endpoint)
+            .post(endpoint)
             .json(&request)
             .send()
             .await?
@@ -360,8 +415,8 @@ impl SemanticEngine {
         Ok(response.response)
     }
 
-    /// 调用OpenAI兼容API
-    async fn call_openai_compatible(&self, prompt: &str) -> Result<String> {
+    /// 调用OpenAI兼容API（Chat Completions）
+    async fn call_openai_chat_completions(&self, prompt: &str, endpoint: &str) -> Result<String> {
         #[derive(Serialize)]
         struct Message {
             role: String,
@@ -401,7 +456,7 @@ impl SemanticEngine {
             max_tokens: self.config.max_tokens,
         };
 
-        let mut req = self.client.post(&self.config.api_endpoint).json(&request);
+        let mut req = self.client.post(endpoint).json(&request);
 
         if !self.config.api_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", self.config.api_key));
@@ -414,6 +469,49 @@ impl SemanticEngine {
             .first()
             .map(|c| c.message.content.clone())
             .ok_or_else(|| anyhow::anyhow!("AI返回空响应"))
+    }
+
+    /// 调用 OpenAI Responses API（如果用户配置了 /v1/responses）
+    async fn call_openai_responses(&self, prompt: &str, endpoint: &str) -> Result<String> {
+        #[derive(Serialize)]
+        struct ResponsesRequest {
+            model: String,
+            input: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            temperature: Option<f32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_output_tokens: Option<u32>,
+        }
+
+        let request = ResponsesRequest {
+            model: self.config.model_name.clone(),
+            input: prompt.to_string(),
+            temperature: Some(self.config.temperature),
+            max_output_tokens: Some(self.config.max_tokens),
+        };
+
+        let mut req = self.client.post(endpoint).json(&request);
+        if !self.config.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.config.api_key));
+        }
+
+        let value: serde_json::Value = req.send().await?.json().await?;
+
+        // 尽量兼容不同实现：优先找 output_text，其次尝试 output->content->text
+        if let Some(s) = value.get("output_text").and_then(|v| v.as_str()) {
+            return Ok(s.to_string());
+        }
+
+        let text = value
+            .get("output")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("content"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.iter().find_map(|c| c.get("text").and_then(|t| t.as_str())))
+            .map(|s| s.to_string());
+
+        text.ok_or_else(|| anyhow::anyhow!("AI返回空响应"))
     }
 
     /// 解析语义分析响应
