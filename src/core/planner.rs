@@ -53,9 +53,21 @@ impl Planner {
                 continue;
             }
 
+            // 规则/AI 的 target_path 通常是“目录”，这里必须拼上文件名。
+            // 否则会把最后一级目录名当作目标文件名，导致扩展名丢失、文件被“改名”。
+            let mut target = suggestion.target_path.clone();
+            let target_leaf = target
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let looks_like_full_file_path = target_leaf == file.name || target_leaf.contains('.');
+            if !looks_like_full_file_path {
+                target = target.join(&file.name);
+            }
+
             plan.add_operation(
                 file.full_path.clone(),
-                suggestion.target_path.clone(),
+                target,
                 file.id.clone(),
             );
         }

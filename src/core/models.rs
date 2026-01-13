@@ -492,3 +492,131 @@ pub struct ErrorCluster {
     /// 最后发生时间
     pub last_occurrence: DateTime<Utc>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_file_descriptor_id_stability() {
+        let path = PathBuf::from("/test/file.txt");
+        let file1 = FileDescriptor::new(
+            path.clone(),
+            "file.txt".to_string(),
+            ".txt".to_string(),
+            1024,
+            Utc::now(),
+            false,
+        );
+        let file2 = FileDescriptor::new(
+            path.clone(),
+            "file.txt".to_string(),
+            ".txt".to_string(),
+            2048, // different size
+            Utc::now(),
+            false,
+        );
+        
+        // Same path should produce same ID
+        assert_eq!(file1.id, file2.id);
+    }
+
+    #[test]
+    fn test_directory_type_atomic() {
+        assert!(DirectoryType::ProgramRoot.is_atomic());
+        assert!(DirectoryType::VirtualEnv.is_atomic());
+        assert!(DirectoryType::PackageRepo.is_atomic());
+        assert!(DirectoryType::System.is_atomic());
+        assert!(!DirectoryType::Normal.is_atomic());
+    }
+
+    #[test]
+    fn test_rule_condition_matches_extension() {
+        let condition = RuleCondition {
+            file_extensions: vec!["jpg".to_string(), "png".to_string()],
+            ..Default::default()
+        };
+        
+        let file = FileDescriptor::new(
+            PathBuf::from("/test/photo.jpg"),
+            "photo.jpg".to_string(),
+            ".jpg".to_string(),
+            1024,
+            Utc::now(),
+            false,
+        );
+        
+        assert!(condition.matches(&file));
+    }
+
+    #[test]
+    fn test_rule_condition_matches_keyword() {
+        let condition = RuleCondition {
+            filename_keywords: vec!["report".to_string(), "文档".to_string()],
+            ..Default::default()
+        };
+        
+        let file = FileDescriptor::new(
+            PathBuf::from("/test/2023_report.pdf"),
+            "2023_report.pdf".to_string(),
+            ".pdf".to_string(),
+            1024,
+            Utc::now(),
+            false,
+        );
+        
+        assert!(condition.matches(&file));
+    }
+
+    #[test]
+    fn test_rule_action_render_path() {
+        let action = RuleAction {
+            move_to: "Documents/{year}/{extension}".to_string(),
+        };
+        
+        let file = FileDescriptor::new(
+            PathBuf::from("/test/report.pdf"),
+            "report.pdf".to_string(),
+            ".pdf".to_string(),
+            1024,
+            Utc::now(),
+            false,
+        );
+        
+        let base_path = PathBuf::from("/output");
+        let rendered = action.render_path(&file, &base_path);
+        
+        assert!(rendered.to_string_lossy().contains("Documents"));
+        assert!(rendered.to_string_lossy().contains("pdf"));
+    }
+
+    #[test]
+    fn test_suggestion_source_display() {
+        assert_eq!(SuggestionSource::AI.to_string(), "AI");
+        assert_eq!(SuggestionSource::Rule.to_string(), "规则");
+        assert_eq!(SuggestionSource::Memory.to_string(), "记忆");
+    }
+
+    #[test]
+    fn test_move_plan_default() {
+        let plan = MovePlan::default();
+        assert!(!plan.batch_id.is_empty());
+        assert!(plan.created_at <= Utc::now());
+        assert!(plan.operations.is_empty());
+    }
+
+    #[test]
+    fn test_app_config_default() {
+        let config = AppConfig::default();
+        assert!(config.ai_enabled);
+        assert_eq!(config.confidence_threshold, 0.7);
+        assert!(config.dry_run_default);
+    }
+
+    #[test]
+    fn test_ai_config_default() {
+        let config = AIConfig::default();
+        assert!(config.api_endpoint.contains("localhost"));
+        assert!(config.model_name.contains("qwen"));
+    }
+}

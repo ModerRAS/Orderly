@@ -22,6 +22,9 @@ use crate::ui::rule_panel::{RulePanel, RulePanelAction};
 use crate::ui::styles::Theme;
 use eframe::egui::{self, RichText};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::thread;
 use tokio::runtime::Runtime;
 
 /// 应用状态
@@ -39,6 +42,22 @@ enum AppState {
     Executing,
 }
 
+enum BackgroundEvent {
+    ScanFinished(Result<Vec<FileDescriptor>, String>),
+    AnalysisProgress { done: usize, total: usize },
+    AnalysisFinished(Vec<(String, crate::core::models::SemanticResult)>),
+    ExecuteFinished {
+        executor: Executor,
+        batch_id: String,
+        result: crate::core::executor::ExecutionResult,
+    },
+    RollbackFinished {
+        executor: Executor,
+        batch_id: String,
+        result: crate::core::executor::RollbackResult,
+    },
+}
+
 /// 主应用程序
 #[allow(dead_code)]
 pub struct OrderlyApp {
@@ -48,6 +67,10 @@ pub struct OrderlyApp {
     config: AppConfig,
     /// 配置管理器
     config_manager: ConfigManager,
+    /// 后台事件发送端
+    bg_tx: Sender<BackgroundEvent>,
+    /// 后台事件接收端
+    bg_rx: Receiver<BackgroundEvent>,
     /// 主题
     theme: Theme,
     /// 扫描路径
@@ -90,6 +113,13 @@ pub struct OrderlyApp {
     correction_counter: std::collections::HashMap<String, u32>,
     /// 待确认的规则
     pending_rule: Option<RuleDefinition>,
+
+    /// 历史面板：当前选择的批次
+    selected_batch_id: Option<String>,
+
+    /// 分析进度
+    analysis_done: usize,
+    analysis_total: usize,
 }
 
 impl OrderlyApp {
@@ -122,10 +152,14 @@ impl OrderlyApp {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        let (bg_tx, bg_rx) = mpsc::channel();
+
         Self {
             state: AppState::Initial,
             config,
             config_manager,
+            bg_tx,
+            bg_rx,
             theme: Theme::default(),
             scan_path,
             output_path,
@@ -147,6 +181,10 @@ impl OrderlyApp {
             show_history_panel: false,
             correction_counter: std::collections::HashMap::new(),
             pending_rule: None,
+
+            selected_batch_id: None,
+            analysis_done: 0,
+            analysis_total: 0,
         }
     }
 
@@ -161,6 +199,111 @@ impl OrderlyApp {
         self.state = AppState::Scanning;
         self.status_message = "正在扫描目录...".to_string();
 
+        let scan_path_str = self.scan_path.clone();
+        let tx = self.bg_tx.clone();
+
+        thread::spawn(move || {
+            let scanner = FileScanner::new(PathBuf::from(scan_path_str));
+            let result = scanner
+                .scan()
+                .map_err(|e| e.to_string())
+                .map(|mut files| {
+                    let analyzer = BoundaryAnalyzer::new();
+                    analyzer.analyze(&mut files);
+                    files
+                });
+            let _ = tx.send(BackgroundEvent::ScanFinished(result));
+        });
+
+
+    fn start_analysis_async(&mut self) {
+        self.state = AppState::Analyzing;
+        self.analysis_done = 0;
+
+        // 先规则匹配一轮
+        if let Some(ref mut engine) = self.rule_engine {
+            engine.match_files(&mut self.files);
+        }
+
+        // 找出需要 AI 分析的文件
+        let to_analyze: Vec<FileDescriptor> = self
+            .files
+            .iter()
+            .filter(|f| f.suggested_action.is_none() && !f.atomic && !f.is_directory)
+            .cloned()
+            .collect();
+
+        self.analysis_total = to_analyze.len();
+        if self.analysis_total == 0 {
+            // 没有需要 AI 的，直接进入预览
+            self.preview_table.sort_files(&mut self.files);
+            self.state = AppState::Preview;
+            let stats = TableStats::from_files(&self.files);
+            self.status_message = format!(
+                "分析完成: {} 个文件, {} 个有建议, {} 个原子目录",
+                stats.total_files, stats.with_suggestion, stats.atomic_files
+            );
+            return;
+        }
+
+        self.status_message = format!("正在分析文件... 0/{}", self.analysis_total);
+
+        let tx = self.bg_tx.clone();
+        let ai_config = self.config.ai_config.clone();
+        let ai_enabled = self.config.ai_enabled;
+        let output_base = if self.output_path.is_empty() {
+            PathBuf::from(&self.scan_path)
+        } else {
+            PathBuf::from(&self.output_path)
+        };
+
+        thread::spawn(move || {
+            let total = to_analyze.len();
+            let mut done = 0usize;
+            let mut results: Vec<(String, crate::core::models::SemanticResult)> = Vec::new();
+
+            if !ai_enabled {
+                for f in to_analyze {
+                    done += 1;
+                    results.push((f.id.clone(), mock_semantic_analysis(&f)));
+                    let _ = tx.send(BackgroundEvent::AnalysisProgress { done, total });
+                }
+                let _ = tx.send(BackgroundEvent::AnalysisFinished(results));
+                return;
+            }
+
+            let runtime = match Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    // runtime 初始化失败，回退 mock
+                    for f in to_analyze {
+                        done += 1;
+                        results.push((f.id.clone(), mock_semantic_analysis(&f)));
+                        let _ = tx.send(BackgroundEvent::AnalysisProgress { done, total });
+                    }
+                    tracing::warn!("Tokio Runtime 初始化失败，回退模拟AI: {}", e);
+                    let _ = tx.send(BackgroundEvent::AnalysisFinished(results));
+                    return;
+                }
+            };
+
+            let engine = SemanticEngine::new(ai_config, output_base);
+            for f in to_analyze {
+                let semantic = match runtime.block_on(engine.analyze_file(&f)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("AI分析失败，回退模拟AI: {}", e);
+                        mock_semantic_analysis(&f)
+                    }
+                };
+                done += 1;
+                results.push((f.id.clone(), semantic));
+                let _ = tx.send(BackgroundEvent::AnalysisProgress { done, total });
+            }
+
+            let _ = tx.send(BackgroundEvent::AnalysisFinished(results));
+        });
+    }
         // 创建扫描器并扫描
         let scanner = FileScanner::new(scan_path);
         match scanner.scan() {
@@ -296,22 +439,134 @@ impl OrderlyApp {
 
     /// 执行移动
     fn execute_move(&mut self) {
-        if let Some(ref mut plan) = self.current_plan {
-            if let Some(ref mut executor) = self.executor {
-                self.state = AppState::Executing;
-                let result = executor.execute(plan);
-                
-                self.status_message = format!(
-                    "执行完成: {}",
-                    result.summary()
-                );
-                
-                // 清理
-                self.current_plan = None;
-                self.dry_run_result = None;
-                
-                // 重新扫描
-                self.start_scan();
+        let mut plan = match self.current_plan.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let executor = match self.executor.take() {
+            Some(e) => e,
+            None => {
+                self.current_plan = Some(plan);
+                return;
+            }
+        };
+
+        self.state = AppState::Executing;
+        self.status_message = "正在执行移动...".to_string();
+
+        let tx = self.bg_tx.clone();
+        thread::spawn(move || {
+            let batch_id = plan.batch_id.clone();
+            let mut exec = executor;
+            let result = exec.execute(&mut plan);
+            let _ = tx.send(BackgroundEvent::ExecuteFinished {
+                executor: exec,
+                batch_id,
+                result,
+            });
+        });
+    }
+
+    fn rollback_batch(&mut self, batch_id: String) {
+        let executor = match self.executor.take() {
+            Some(e) => e,
+            None => return,
+        };
+        self.state = AppState::Executing;
+        self.status_message = format!("正在回滚批次: {}", batch_id);
+        let tx = self.bg_tx.clone();
+        thread::spawn(move || {
+            let mut exec = executor;
+            let result = exec.rollback(&batch_id);
+            let _ = tx.send(BackgroundEvent::RollbackFinished {
+                executor: exec,
+                batch_id,
+                result,
+            });
+        });
+    }
+
+    fn pump_background_events(&mut self) {
+        while let Ok(ev) = self.bg_rx.try_recv() {
+            match ev {
+                BackgroundEvent::ScanFinished(result) => {
+                    match result {
+                        Ok(files) => {
+                            self.files = files;
+
+                            // 初始化规则引擎/Planner
+                            let output_base = if self.output_path.is_empty() {
+                                PathBuf::from(&self.scan_path)
+                            } else {
+                                PathBuf::from(&self.output_path)
+                            };
+
+                            self.rule_engine = Some(RuleEngine::new(output_base.clone()));
+                            self.planner = Some(Planner::new(output_base, self.config.confidence_threshold));
+
+                            // 进入分析
+                            self.start_analysis_async();
+                        }
+                        Err(e) => {
+                            self.status_message = format!("扫描失败: {}", e);
+                            self.state = AppState::Initial;
+                        }
+                    }
+                }
+                BackgroundEvent::AnalysisProgress { done, total } => {
+                    self.analysis_done = done;
+                    self.analysis_total = total;
+                    self.status_message = format!("正在分析文件... {}/{}", done, total);
+                }
+                BackgroundEvent::AnalysisFinished(results) => {
+                    // 回填语义
+                    for (id, semantic) in results {
+                        if let Some(file) = self.files.iter_mut().find(|f| f.id == id) {
+                            file.semantic = Some(semantic);
+                        }
+                    }
+
+                    // 对仍无建议的文件，再做一次规则匹配（让基于 semantic_tags 的规则生效）
+                    if let Some(ref mut engine) = self.rule_engine {
+                        for file in self.files.iter_mut() {
+                            if file.suggested_action.is_none() && !file.atomic && !file.is_directory {
+                                if let Some(suggestion) = engine.match_file(file) {
+                                    file.suggested_action = Some(suggestion);
+                                }
+                            }
+                        }
+                    }
+
+                    self.preview_table.sort_files(&mut self.files);
+                    self.state = AppState::Preview;
+                    let stats = TableStats::from_files(&self.files);
+                    self.status_message = format!(
+                        "分析完成: {} 个文件, {} 个有建议, {} 个原子目录",
+                        stats.total_files, stats.with_suggestion, stats.atomic_files
+                    );
+                }
+                BackgroundEvent::ExecuteFinished {
+                    executor,
+                    batch_id,
+                    result,
+                } => {
+                    self.executor = Some(executor);
+                    self.status_message = format!("执行完成(批次 {}): {}", batch_id, result.summary());
+                    self.current_plan = None;
+                    self.dry_run_result = None;
+
+                    // 执行完成后异步重新扫描
+                    self.start_scan();
+                }
+                BackgroundEvent::RollbackFinished {
+                    executor,
+                    batch_id,
+                    result,
+                } => {
+                    self.executor = Some(executor);
+                    self.status_message = format!("回滚完成(批次 {}): {}", batch_id, result.summary());
+                    self.start_scan();
+                }
             }
         }
     }
@@ -387,6 +642,8 @@ impl OrderlyApp {
 
 impl eframe::App for OrderlyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pump_background_events();
+
         // 顶部菜单栏
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -478,6 +735,57 @@ impl eframe::App for OrderlyApp {
                             }
                             RulePanelAction::None => {}
                         }
+                    }
+                });
+        }
+
+        // 右侧历史面板（可选）
+        if self.show_history_panel {
+            egui::SidePanel::right("history_panel")
+                .default_width(340.0)
+                .show(ctx, |ui| {
+                    ui.heading("历史记录");
+                    ui.separator();
+
+                    if let Some(ref executor) = self.executor {
+                        let history = executor.get_recent_history(30);
+                        if history.is_empty() {
+                            ui.label("暂无历史记录");
+                            return;
+                        }
+
+                        egui::ScrollArea::vertical().max_height(600.0).show(ui, |ui| {
+                            for entry in history {
+                                let selected = self
+                                    .selected_batch_id
+                                    .as_ref()
+                                    .map(|s| s == &entry.batch_id)
+                                    .unwrap_or(false);
+
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(selected, format!("批次 {}", &entry.batch_id[..8])).clicked() {
+                                            self.selected_batch_id = Some(entry.batch_id.clone());
+                                        }
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(if entry.rolled_back { "已回滚" } else { "已执行" });
+                                        });
+                                    });
+
+                                    ui.label(format!("时间: {}", entry.executed_at));
+                                    ui.label(format!("操作数: {}", entry.operations.len()));
+
+                                    if !entry.rolled_back {
+                                        if ui.button("↩️ 回滚此批次").clicked() {
+                                            self.rollback_batch(entry.batch_id.clone());
+                                        }
+                                    }
+                                });
+                                ui.add_space(6.0);
+                            }
+                        });
+                    } else {
+                        ui.label("执行器未初始化");
                     }
                 });
         }
