@@ -215,6 +215,7 @@ impl OrderlyApp {
             let _ = tx.send(BackgroundEvent::ScanFinished(result));
         });
 
+    }
 
     fn start_analysis_async(&mut self) {
         self.state = AppState::Analyzing;

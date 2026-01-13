@@ -246,7 +246,6 @@ impl PlanStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
     #[test]
     fn test_fuse_suggestions() {
