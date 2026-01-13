@@ -238,10 +238,25 @@ pub struct RuleCondition {
 impl RuleCondition {
     /// 检查文件是否匹配此条件
     pub fn matches(&self, file: &FileDescriptor) -> bool {
+        let normalize_ext = |ext: &str| {
+            let ext = ext.trim().to_lowercase();
+            if ext.is_empty() {
+                ext
+            } else if ext.starts_with('.') {
+                ext
+            } else {
+                format!(".{}", ext)
+            }
+        };
+
         // 检查扩展名
         if !self.file_extensions.is_empty() {
-            let ext_lower = file.extension.to_lowercase();
-            if !self.file_extensions.iter().any(|e| e.to_lowercase() == ext_lower) {
+            let ext_lower = normalize_ext(&file.extension);
+            if !self
+                .file_extensions
+                .iter()
+                .any(|e| normalize_ext(e) == ext_lower)
+            {
                 return false;
             }
         }

@@ -82,6 +82,11 @@ impl FileScanner {
 
     /// 判断是否应该包含此条目
     fn should_include(&self, entry: &walkdir::DirEntry) -> bool {
+        // 根目录必须允许遍历，否则 filter_entry 会直接阻止深入扫描
+        if entry.path() == self.root_path {
+            return true;
+        }
+
         let name = entry.file_name().to_string_lossy();
         
         // 检查隐藏文件

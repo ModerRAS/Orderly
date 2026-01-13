@@ -305,103 +305,6 @@ impl OrderlyApp {
             let _ = tx.send(BackgroundEvent::AnalysisFinished(results));
         });
     }
-        // 创建扫描器并扫描
-        let scanner = FileScanner::new(scan_path);
-        match scanner.scan() {
-            Ok(mut files) => {
-                // 分析目录边界
-                let analyzer = BoundaryAnalyzer::new();
-                analyzer.analyze(&mut files);
-
-                self.files = files;
-                self.status_message = format!("扫描完成，共 {} 个文件/目录", self.files.len());
-                
-                // 初始化规则引擎
-                let output_base = if self.output_path.is_empty() {
-                    PathBuf::from(&self.scan_path)
-                } else {
-                    PathBuf::from(&self.output_path)
-                };
-                
-                self.rule_engine = Some(RuleEngine::new(output_base.clone()));
-                self.planner = Some(Planner::new(output_base, self.config.confidence_threshold));
-
-                // 进入分析阶段
-                self.start_analysis();
-            }
-            Err(e) => {
-                self.status_message = format!("扫描失败: {}", e);
-                self.state = AppState::Initial;
-            }
-        }
-    }
-
-    /// 开始分析
-    fn start_analysis(&mut self) {
-        self.state = AppState::Analyzing;
-        self.status_message = "正在分析文件...".to_string();
-
-        // 使用规则引擎匹配
-        if let Some(ref mut engine) = self.rule_engine {
-            engine.match_files(&mut self.files);
-        }
-
-        let output_base = if self.output_path.is_empty() {
-            PathBuf::from(&self.scan_path)
-        } else {
-            PathBuf::from(&self.output_path)
-        };
-
-        // 对没有规则匹配的文件使用 AI 语义分析（失败时回退模拟）
-        let mut rt = match Runtime::new() {
-            Ok(rt) => Some(rt),
-            Err(e) => {
-                tracing::warn!("Tokio Runtime 初始化失败，回退模拟AI: {}", e);
-                None
-            }
-        };
-
-        let ai_engine = if self.config.ai_enabled {
-            Some(SemanticEngine::new(self.config.ai_config.clone(), output_base.clone()))
-        } else {
-            None
-        };
-
-        for file in self.files.iter_mut() {
-            if file.suggested_action.is_none() && !file.atomic && !file.is_directory {
-                let semantic = if let (Some(ref engine), Some(ref mut runtime)) = (&ai_engine, &mut rt) {
-                    match runtime.block_on(engine.analyze_file(file)) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!("AI分析失败，回退模拟AI: {}", e);
-                            mock_semantic_analysis(file)
-                        }
-                    }
-                } else {
-                    mock_semantic_analysis(file)
-                };
-
-                file.semantic = Some(semantic);
-
-                // 尝试再次规则匹配
-                if let Some(ref mut engine) = self.rule_engine {
-                    if let Some(suggestion) = engine.match_file(file) {
-                        file.suggested_action = Some(suggestion);
-                    }
-                }
-            }
-        }
-
-        // 排序文件列表
-        self.preview_table.sort_files(&mut self.files);
-
-        self.state = AppState::Preview;
-        let stats = TableStats::from_files(&self.files);
-        self.status_message = format!(
-            "分析完成: {} 个文件, {} 个有建议, {} 个原子目录",
-            stats.total_files, stats.with_suggestion, stats.atomic_files
-        );
-    }
 
     /// 生成移动计划
     fn generate_plan(&mut self) {
@@ -748,46 +651,54 @@ impl eframe::App for OrderlyApp {
                     ui.heading("历史记录");
                     ui.separator();
 
-                    if let Some(ref executor) = self.executor {
-                        let history = executor.get_recent_history(30);
-                        if history.is_empty() {
-                            ui.label("暂无历史记录");
-                            return;
-                        }
+                    let history_items: Vec<(String, chrono::DateTime<chrono::Utc>, usize, bool)> = self
+                        .executor
+                        .as_ref()
+                        .map(|executor| {
+                            executor
+                                .get_recent_history(30)
+                                .into_iter()
+                                .map(|entry| (entry.batch_id.clone(), entry.executed_at, entry.operations.len(), entry.rolled_back))
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
-                        egui::ScrollArea::vertical().max_height(600.0).show(ui, |ui| {
-                            for entry in history {
-                                let selected = self
-                                    .selected_batch_id
-                                    .as_ref()
-                                    .map(|s| s == &entry.batch_id)
-                                    .unwrap_or(false);
-
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        if ui.selectable_label(selected, format!("批次 {}", &entry.batch_id[..8])).clicked() {
-                                            self.selected_batch_id = Some(entry.batch_id.clone());
-                                        }
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            ui.label(if entry.rolled_back { "已回滚" } else { "已执行" });
-                                        });
-                                    });
-
-                                    ui.label(format!("时间: {}", entry.executed_at));
-                                    ui.label(format!("操作数: {}", entry.operations.len()));
-
-                                    if !entry.rolled_back {
-                                        if ui.button("↩️ 回滚此批次").clicked() {
-                                            self.rollback_batch(entry.batch_id.clone());
-                                        }
-                                    }
-                                });
-                                ui.add_space(6.0);
-                            }
-                        });
-                    } else {
-                        ui.label("执行器未初始化");
+                    if history_items.is_empty() {
+                        ui.label("暂无历史记录");
+                        return;
                     }
+
+                    egui::ScrollArea::vertical().max_height(600.0).show(ui, |ui| {
+                        for (batch_id, executed_at, op_len, rolled_back) in history_items {
+                            let selected = self
+                                .selected_batch_id
+                                .as_ref()
+                                .map(|s| s == &batch_id)
+                                .unwrap_or(false);
+
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    let short_id = batch_id.get(0..8).unwrap_or(&batch_id);
+                                    if ui.selectable_label(selected, format!("批次 {}", short_id)).clicked() {
+                                        self.selected_batch_id = Some(batch_id.clone());
+                                    }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(if rolled_back { "已回滚" } else { "已执行" });
+                                    });
+                                });
+
+                                ui.label(format!("时间: {}", executed_at));
+                                ui.label(format!("操作数: {}", op_len));
+
+                                if !rolled_back {
+                                    if ui.button("↩️ 回滚此批次").clicked() {
+                                        self.rollback_batch(batch_id.clone());
+                                    }
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                    });
                 });
         }
 
@@ -940,7 +851,7 @@ impl OrderlyApp {
             RuleConfirmResult::Accept => {
                 self.save_pending_rule();
                 // 重新分析
-                self.start_analysis();
+                self.start_analysis_async();
             }
             RuleConfirmResult::ApplyOnce => {
                 // 仅本次应用，不保存
