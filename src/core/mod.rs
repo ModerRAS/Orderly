@@ -7,3 +7,6 @@ pub mod semantic;
 pub mod rule_engine;
 pub mod planner;
 pub mod executor;
+
+#[cfg(test)]
+mod sim_integration_tests;
